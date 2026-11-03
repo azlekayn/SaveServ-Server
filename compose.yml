@@ -1,0 +1,17 @@
+# docker compose up -d   ->  http://saves.docker-host.lan (the container name is the
+# subdomain), or http://docker-host.lan:8787 directly
+services:
+  saveserv:
+    build: .
+    image: saveserv:latest
+    container_name: saves
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/data
+    environment:
+      # "first": only the first account may self-register; add others from
+      # the Account page. "open": anyone on the network may register.
+      SAVESERV_REGISTER: first
+      SAVESERV_KEEP: "50"

@@ -1,0 +1,8 @@
+FROM python:3.12-alpine
+WORKDIR /app
+COPY saveserv.py .
+ENV SAVESERV_DATA=/data SAVESERV_PORT=8787 PYTHONUNBUFFERED=1
+VOLUME /data
+EXPOSE 8787
+USER 1000:1000
+CMD ["python3", "-I", "saveserv.py"]
