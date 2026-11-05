@@ -1,36 +1,45 @@
 #!/usr/bin/env python3
 """SaveServ: save sync server for game launchers, recomps and emulators.
 
-Accounts own saves. A launcher pairs to an account with a PIN:
-  1. launcher  POST /api/pair {"name": "RG35XXSP"}  -> {"id", "pin", "expires"}
-  2. the user logs in on the website, opens "Pair device", types the PIN
-  3. launcher  GET /api/pair/<id>  -> 202 while pending, 200 {"token"} once paired
-Then every API call carries "Authorization: Bearer <token>".
+Accounts own saves. A device pairs to an account with a PIN:
+  1. device  POST /api/pair {"name": "RG35XXSP"}  -> {"id", "pin", "expires"}
+  2. the user logs in on the website, clicks the + cover, types the PIN
+  3. device  GET /api/pair/<id>  -> 202 while pending, 200 {"token"} once paired
+Then every device call carries "Authorization: Bearer <token>".
 
-Saves are addressed as <game>/<slot>: a recomp uses its game id and variant
-(ffta/remix); an emulator agent uses the system and ROM name (gba/Golden Sun). Every upload is kept
-as a new revision (the last KEEP per slot), so nothing is ever overwritten:
+Saves are addressed as <game>/<slot>: a recomp uses its game id and version
+(ffta/remix); an emulator folder uses the system and ROM name (gba/Golden Sun
+(USA)). Every upload is kept as a new revision (the last KEEP per slot):
   GET  /api/saves/<game>               {"slot": {"rev","sha256","size","updated","device"}}
   GET  /api/saves/<game>/<slot>        bytes (headers X-Rev, X-Sha256)
   PUT  /api/saves/<game>/<slot>?base=N bytes; 409 unless N is the current rev (0 = none)
+  PUT  /api/meta/<game>                {"title", "system", "rom", "slots": {"remix": "Remix"}}
+       optional: how the website names the game and finds its box art
+
+The website (server/web/) is a single page that talks to /web/* with the
+session cookie. Covers come from, in order: an uploaded cover for the save,
+an uploaded cover for the game, libretro box art (system + ROM name), and a
+generated tile.
 
 Standard library only. Configuration (environment):
-  SAVESERV_DATA     data directory (default /data)
-  SAVESERV_PORT     listen port (default 8787)
-  SAVESERV_REGISTER "open" lets anyone register; "first" (default) only the
-                    first account, later accounts are added from Account page
-  SAVESERV_KEEP     revisions kept per slot (default 50)
+  SAVESERV_DATA       data directory (default /data)
+  SAVESERV_PORT       listen port (default 8787)
+  SAVESERV_REGISTER   "open" lets anyone register; "first" (default) only the
+                      first account, later accounts are added by the owner
+  SAVESERV_KEEP       revisions kept per slot (default 50)
+  SAVESERV_THUMBNAILS "0" turns off fetching libretro box art
 """
 import hashlib
 import hmac
-import html
 import json
+import mimetypes
 import os
 import re
 import secrets
 import sqlite3
 import threading
 import time
+import urllib.request
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -39,12 +48,25 @@ DATA = os.environ.get("SAVESERV_DATA", "/data")
 PORT = int(os.environ.get("SAVESERV_PORT", "8787"))
 REGISTER = os.environ.get("SAVESERV_REGISTER", "first")
 KEEP = int(os.environ.get("SAVESERV_KEEP", "50"))
+THUMBNAILS = os.environ.get("SAVESERV_THUMBNAILS", "1") != "0"
+WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 MAX_SAVE = 4 << 20
+MAX_IMAGE = 3 << 20
 PIN_TTL = 600
 NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 # Slots may be ROM-style file names ("Golden Sun (USA)"), but no path parts.
 SLOT = re.compile(r"^(?!\.\.?$)[^/\\\x00-\x1f]{1,200}$")
 USER = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+
+# libretro-thumbnails system folders for common save "games".
+SYSTEMS = {
+    "gba": "Nintendo - Game Boy Advance", "gb": "Nintendo - Game Boy",
+    "gbc": "Nintendo - Game Boy Color", "nes": "Nintendo - Nintendo Entertainment System",
+    "snes": "Nintendo - Super Nintendo Entertainment System", "n64": "Nintendo - Nintendo 64",
+    "nds": "Nintendo - Nintendo DS", "md": "Sega - Mega Drive - Genesis",
+    "genesis": "Sega - Mega Drive - Genesis", "sms": "Sega - Master System - Mark III",
+    "gg": "Sega - Game Gear", "psx": "Sony - PlayStation", "pce": "NEC - PC Engine - TurboGrafx 16",
+}
 
 os.makedirs(os.path.join(DATA, "blobs"), exist_ok=True)
 DB_LOCK = threading.Lock()
@@ -56,8 +78,20 @@ create table if not exists devices(id integer primary key, user int, name text, 
                                    created int, seen int);
 create table if not exists revs(user int, game text, slot text, rev int, sha text, size int,
                                 device text, created int, primary key(user, game, slot, rev));
+create table if not exists meta(user int, game text, slot text, title text, cover text,
+                                primary key(user, game, slot));
+create table if not exists games(user int, game text, title text, system text, rom text,
+                                 primary key(user, game));
+create table if not exists thumbs(key text primary key, sha text, fetched int);
 """)
-# Pending pairings live in memory: id -> {pin, name, expires, token, tries}
+for table, column in (("users", "display text"), ("users", "avatar text"),
+                      ("sessions", "agent text"), ("sessions", "seen int")):
+    try:
+        DB.execute(f"alter table {table} add column {column}")
+    except sqlite3.OperationalError:
+        pass  # already there
+DB.commit()
+# Pending pairings live in memory: id -> {pin, name, expires, token, account}
 PAIRS = {}
 PAIRS_LOCK = threading.Lock()
 
@@ -89,61 +123,128 @@ def blob_path(digest):
     return os.path.join(DATA, "blobs", digest)
 
 
+def put_blob(data):
+    digest = sha(data)
+    if not os.path.exists(blob_path(digest)):
+        tmp = blob_path(digest) + f".{secrets.token_hex(4)}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, blob_path(digest))
+    return digest
+
+
+def drop_blob_if_unused(digest):
+    if not digest:
+        return
+    for q in ("select 1 from revs where sha=? limit 1", "select 1 from meta where cover=? limit 1",
+              "select 1 from users where avatar=? limit 1", "select 1 from thumbs where sha=? limit 1"):
+        if db(q, (digest,)):
+            return
+    try:
+        os.remove(blob_path(digest))
+    except FileNotFoundError:
+        pass
+
+
 def prune(user, game, slot):
     old = db("select rev, sha from revs where user=? and game=? and slot=? order by rev desc limit -1 offset ?",
              (user, game, slot, KEEP))
     for rev, digest in old:
         db("delete from revs where user=? and game=? and slot=? and rev=?", (user, game, slot, rev))
-        if not db("select 1 from revs where sha=? limit 1", (digest,)):
+        drop_blob_if_unused(digest)
+
+
+IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", "image/png"), (b"\xff\xd8\xff", "image/jpeg"),
+               (b"GIF8", "image/gif"), (b"RIFF", "image/webp"))
+
+
+def image_type(data):
+    for magic, kind in IMAGE_MAGIC:
+        if data.startswith(magic) and (kind != "image/webp" or data[8:12] == b"WEBP"):
+            return kind
+    return None
+
+
+INDEX = {}  # libretro folder -> (fetched, [names])
+INDEX_LOCK = threading.Lock()
+
+
+def fetch(url, limit):
+    req = urllib.request.Request(url, headers={"User-Agent": "SaveServ"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return r.read(limit + 1)
+
+
+def base_title(name):
+    return re.sub(r"\s*[(\[][^)\]]*[)\]]", "", name).strip().lower()
+
+
+def best_match(folder, rom):
+    """Closest box art name when the exact ROM name has none: same title
+    without tags, preferring USA, World, Europe, Japan; never Virtual Console."""
+    with INDEX_LOCK:
+        when, names = INDEX.get(folder, (0, []))
+        if time.time() - when > 86400:
             try:
-                os.remove(blob_path(digest))
-            except FileNotFoundError:
-                pass
+                page = fetch(f"https://thumbnails.libretro.com/{quote(folder)}/Named_Boxarts/", 16 << 20).decode("utf-8", "replace")
+                names = sorted({unquote(n) for n in re.findall(r'href="([^"/?]+)\.png"', page)})
+            except Exception as e:
+                print(f"thumbnail index {folder}: {e}", flush=True)
+            INDEX[folder] = (time.time(), names)
+    want = base_title(rom)
+    cands = [n for n in names if base_title(n) == want and "Virtual Console" not in n]
+    for region in ("(USA", "(World", "(Europe", "(Japan", ""):
+        hit = next((n for n in cands if region in n), None)
+        if hit:
+            return hit
+    return None
 
 
-def ago(t):
-    s = int(time.time()) - int(t)
-    if s < 60:
-        return "just now"
-    if s < 3600:
-        return f"{s // 60} min ago"
-    if s < 86400:
-        return f"{s // 3600} h ago"
-    return f"{s // 86400} d ago"
+def libretro_art(system, rom):
+    """Box art from thumbnails.libretro.com, cached (also misses, for a day)."""
+    folder = SYSTEMS.get(system)
+    if not (THUMBNAILS and folder and rom):
+        return None
+    key = f"{folder}/{rom}"
+    row = db("select sha, fetched from thumbs where key=?", (key,), one=True)
+    if row and (row[0] or time.time() - row[1] < 86400):
+        return row[0] or None
+    digest = ""
+    for name in (rom, None):
+        if name is None:
+            name = best_match(folder, rom)
+            if not name or name == rom:
+                break
+        url = f"https://thumbnails.libretro.com/{quote(folder)}/Named_Boxarts/{quote(re.sub(r'[&*/:`<>?|\\\"]', '_', name))}.png"
+        try:
+            data = fetch(url, MAX_IMAGE)
+            if len(data) <= MAX_IMAGE and image_type(data):
+                digest = put_blob(data)
+                break
+        except Exception as e:  # offline, 404: try the closest name, then a generated tile
+            print(f"thumbnail {url}: {e}", flush=True)
+    db("insert or replace into thumbs values(?,?,?)", (key, digest, int(time.time())))
+    return digest or None
 
 
-CSS = """
-:root{--bg:#10182f;--panel:#1c284c;--text:#ececE4;--dim:#96a0b8;--hi:#c8a848;--bad:#d06060}
-@media (prefers-color-scheme: light){:root{--bg:#f3f1ea;--panel:#fff;--text:#1a1f2e;--dim:#5b6475;--hi:#8a6a10;--bad:#a03030}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,sans-serif}
-main{max-width:760px;margin:0 auto;padding:16px}
-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}
-h1{font-size:1.3rem;margin:0}h1 span{color:var(--hi)}h2{font-size:1.05rem;margin:24px 0 8px}
-nav a{color:var(--dim);margin-left:12px;text-decoration:none}nav a:hover{color:var(--text)}
-section{background:var(--panel);border-radius:10px;padding:14px 16px;margin:12px 0}
-table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:6px 4px;border-bottom:1px solid #8883}
-th{color:var(--dim);font-weight:500;font-size:.85rem}
-input{font:inherit;padding:8px 10px;border-radius:6px;border:1px solid #8886;background:transparent;color:inherit;width:100%;max-width:280px}
-input.pin{font-size:1.6rem;letter-spacing:.3em;max-width:200px;text-align:center}
-button{font:inherit;padding:8px 14px;border-radius:6px;border:0;background:var(--hi);color:#111;cursor:pointer}
-button.link{background:none;color:var(--bad);padding:0}
-.dim{color:var(--dim)}.msg{color:var(--hi)}.err{color:var(--bad)}form.inline{display:inline}
-label{display:block;margin:8px 0 4px;color:var(--dim)}a{color:var(--hi)}
-"""
+def placeholder_svg(title, seed):
+    hue = int(sha(seed.encode())[:4], 16) % 360
+    words = [w for w in re.split(r"[\s_\-:()]+", title) if w and w[0].isalnum()]
+    initials = "".join(w[0] for w in words[:2]).upper() or "?"
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0" stop-color="hsl({hue},45%,38%)"/><stop offset="1" stop-color="hsl({(hue + 40) % 360},50%,22%)"/>
+</linearGradient></defs><rect width="256" height="256" fill="url(#g)"/>
+<text x="128" y="150" font-family="system-ui,sans-serif" font-size="96" font-weight="700"
+ text-anchor="middle" fill="rgba(255,255,255,.85)">{initials}</text></svg>"""
 
 
-def page(title, body, user=None):
-    nav = ""
-    if user:
-        nav = ('<nav><a href="/">Saves</a><a href="/pair">Pair device</a><a href="/devices">Devices</a>'
-               f'<a href="/account">{html.escape(user[1])}</a></nav>')
-    return (f"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-            f"<title>{html.escape(title)}</title><style>{CSS}</style></head><body><main>"
-            f"<header><h1>Save<span>Serv</span></h1>{nav}</header>{body}</main></body></html>")
+def pretty(word):
+    return re.sub(r"[_-]+", " ", word).strip().title() if word.islower() else word
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "saveserv/1"
+    server_version = "saveserv/2"
 
     def log_message(self, fmt, *args):
         print(f"{self.address_string()} {fmt % args}", flush=True)
@@ -157,14 +258,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
         for k, v in headers:
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def html(self, title, body, user=None, code=200, headers=()):
-        self.send(code, page(title, body, user), "text/html; charset=utf-8", headers)
+    def err(self, code, msg):
+        return self.send(code, {"error": msg})
 
     def redirect(self, where, headers=()):
         self.send(303, b"", "text/plain", [("Location", where), *headers])
@@ -175,16 +277,26 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("too large")
         return self.rfile.read(n) if n else b""
 
-    def form(self):
-        return {k: v[0] for k, v in parse_qs(self.body(65536).decode()).items()}
+    def json_body(self):
+        try:
+            v = json.loads(self.body(65536) or b"{}")
+        except json.JSONDecodeError:
+            raise ValueError("bad JSON")
+        if not isinstance(v, dict):
+            raise ValueError("expected an object")
+        return v
 
-    def session_user(self):
+    def session(self):
         c = SimpleCookie(self.headers.get("Cookie") or "")
         if "sid" not in c:
             return None
-        row = db("select u.id, u.name from sessions s join users u on u.id=s.user where s.token=?",
-                 (sha(c["sid"].value.encode()),), one=True)
-        return row
+        tok = sha(c["sid"].value.encode())
+        row = db("select u.id, u.name, u.display, u.avatar from sessions s join users u on u.id=s.user "
+                 "where s.token=?", (tok,), one=True)
+        if row:
+            db("update sessions set seen=? where token=?", (int(time.time()), tok))
+            return {"id": row[0], "name": row[1], "display": row[2] or row[1], "avatar": row[3], "token": tok}
+        return None
 
     def device(self):
         auth = self.headers.get("Authorization") or ""
@@ -197,8 +309,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def login(self, uid):
         tok = secrets.token_urlsafe(32)
-        db("insert into sessions values(?,?,?)", (sha(tok.encode()), uid, int(time.time())))
+        agent = (self.headers.get("User-Agent") or "")[:200]
+        now = int(time.time())
+        db("insert into sessions(token, user, created, agent, seen) values(?,?,?,?,?)",
+           (sha(tok.encode()), uid, now, agent, now))
         return ("Set-Cookie", f"sid={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000")
+
+    def static(self, name):
+        path = os.path.realpath(os.path.join(WEB, name))
+        if not path.startswith(os.path.realpath(WEB) + os.sep) or not os.path.isfile(path):
+            return self.send(404, "not found", "text/plain")
+        with open(path, "rb") as f:
+            data = f.read()
+        kind = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        if kind.startswith("text/") or kind.endswith("javascript"):
+            kind += "; charset=utf-8"
+        self.send(200, data, kind, [("Cache-Control", "no-cache")])
 
     # ---- routing -----------------------------------------------------------
     def do_GET(self):
@@ -213,6 +339,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         self.route("PUT")
 
+    def do_DELETE(self):
+        self.route("DELETE")
+
     def route(self, method):
         url = urlparse(self.path)
         parts = [unquote(p) for p in url.path.split("/") if p]
@@ -220,15 +349,28 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parts[:1] == ["api"]:
                 return self.api(method, parts[1:], q)
-            return self.web(method, parts, q)
+            if parts[:1] == ["web"]:
+                return self.web_api(method, parts[1:], q)
+            if parts[:1] == ["static"] and len(parts) == 2:
+                return self.static(parts[1])
+            if parts[:1] == ["img"] and len(parts) == 2 and re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+                return self.image(parts[1])
+            if parts[:1] in (["cover"], ["download"], ["avatar"]):
+                user = self.session()
+                if not user:
+                    return self.send(401, "log in first", "text/plain")
+                return {"cover": self.cover, "download": self.download, "avatar": self.avatar}[parts[0]](user, parts[1:])
+            if method == "GET":
+                return self.static("index.html")  # the single page handles every other path
+            return self.err(404, "not found")
         except ValueError as e:
-            self.send(400, {"error": str(e)})
+            self.err(400, str(e))
 
-    # ---- launcher API -------------------------------------------------------
+    # ---- device API ---------------------------------------------------------
     def api(self, method, p, q):
         now = int(time.time())
         if p == ["hello"]:
-            return self.send(200, {"service": "saveserv", "version": 1})
+            return self.send(200, {"service": "saveserv", "version": 2})
         if p == ["pair"] and method == "POST":
             req = json.loads(self.body(4096) or b"{}")
             name = str(req.get("name") or "device")[:40]
@@ -246,7 +388,7 @@ class Handler(BaseHTTPRequestHandler):
             with PAIRS_LOCK:
                 pr = PAIRS.get(p[1])
                 if not pr or (pr["expires"] < now and not pr["token"]):
-                    return self.send(404, {"error": "expired"})
+                    return self.err(404, "expired")
                 if not pr["token"]:
                     return self.send(202, {"status": "pending"})
                 del PAIRS[p[1]]
@@ -254,13 +396,25 @@ class Handler(BaseHTTPRequestHandler):
 
         dev = self.device()
         if not dev:
-            return self.send(401, {"error": "not paired"})
+            return self.err(401, "not paired")
         _, uid, dname = dev
         if p == ["whoami"]:
             u = db("select name from users where id=?", (uid,), one=True)
             return self.send(200, {"account": u[0], "device": dname})
+        if len(p) == 2 and p[0] == "meta" and NAME.match(p[1]) and method == "PUT":
+            m = self.json_body()
+            text = lambda k, n=120: str(m.get(k) or "")[:n] or None  # noqa: E731
+            db("insert or replace into games values(?,?,?,?,?)",
+               (uid, p[1], text("title"), text("system", 16), text("rom", 200)))
+            for slot, name in (m.get("slots") or {}).items():
+                # Device names only fill blanks: a rename on the website wins.
+                if SLOT.match(str(slot)) and name:
+                    db("insert or ignore into meta values(?,?,?,?,null)", (uid, p[1], slot, str(name)[:80]))
+                    db("update meta set title=? where user=? and game=? and slot=? and title is null",
+                       (str(name)[:80], uid, p[1], slot))
+            return self.send(200, {"ok": True})
         if p[:1] != ["saves"] or len(p) not in (2, 3) or not NAME.match(p[1]) or (len(p) == 3 and not SLOT.match(p[2])):
-            return self.send(404, {"error": "not found"})
+            return self.err(404, "not found")
         game = p[1]
         if len(p) == 2 and method == "GET":
             rows = db("""select slot, rev, sha, size, created, device from revs r where user=? and game=?
@@ -273,7 +427,7 @@ class Handler(BaseHTTPRequestHandler):
                  (uid, game, slot), one=True)
         if method == "GET":
             if not cur:
-                return self.send(404, {"error": "no save"})
+                return self.err(404, "no save")
             with open(blob_path(cur[1]), "rb") as f:
                 data = f.read()
             return self.send(200, data, "application/octet-stream",
@@ -282,7 +436,7 @@ class Handler(BaseHTTPRequestHandler):
             base = int(q.get("base", "0"))
             data = self.body()
             if not data:
-                return self.send(400, {"error": "empty save"})
+                return self.err(400, "empty save")
             with DB_LOCK:  # check-and-insert must be atomic
                 row = DB.execute("select rev, sha from revs where user=? and game=? and slot=? order by rev desc limit 1",
                                  (uid, game, slot)).fetchone()
@@ -302,181 +456,254 @@ class Handler(BaseHTTPRequestHandler):
                 DB.commit()
             prune(uid, game, slot)
             return self.send(200, {"rev": rev + 1})
-        return self.send(405, {"error": "method"})
+        return self.err(405, "method")
 
-    # ---- website ------------------------------------------------------------
-    def web(self, method, p, q):
-        user = self.session_user()
+    # ---- files for the website -------------------------------------------------
+    def image(self, digest):
+        path = blob_path(digest)
+        if not os.path.exists(path):
+            return self.send(404, "not found", "text/plain")
+        with open(path, "rb") as f:
+            data = f.read(MAX_IMAGE + 1)
+        kind = image_type(data)
+        if not kind:
+            return self.send(404, "not an image", "text/plain")
+        self.send(200, data, kind, [("Cache-Control", "public, max-age=31536000, immutable")])
+
+    def cover_sha(self, uid, game, slot):
+        for s in (slot, "*"):
+            row = db("select cover from meta where user=? and game=? and slot=?", (uid, game, s), one=True)
+            if row and row[0]:
+                return row[0]
+        g = db("select system, rom from games where user=? and game=?", (uid, game), one=True)
+        if g and g[0] and g[1]:
+            return libretro_art(g[0], g[1])
+        if game in SYSTEMS:  # emulator folder: the slot is the ROM name
+            return libretro_art(game, slot)
+        return None
+
+    def cover(self, user, p):
+        if len(p) != 2 or not NAME.match(p[0]) or not SLOT.match(p[1]):
+            return self.send(404, "not found", "text/plain")
+        digest = self.cover_sha(user["id"], p[0], p[1])
+        if digest:
+            return self.redirect(f"/img/{digest}")
+        title = self.game_title(user["id"], p[0], p[1])
+        self.send(200, placeholder_svg(title, p[0]), "image/svg+xml", [("Cache-Control", "no-cache")])
+
+    def avatar(self, user, p):
+        uid = int(p[0]) if p and p[0].isdigit() else user["id"]
+        row = db("select avatar, name, display from users where id=?", (uid,), one=True)
+        if row and row[0]:
+            return self.redirect(f"/img/{row[0]}")
+        self.send(200, placeholder_svg(row[2] or row[1] if row else "?", f"user:{uid}"), "image/svg+xml",
+                  [("Cache-Control", "no-cache")])
+
+    def download(self, user, p):
+        if len(p) != 3 or not NAME.match(p[0]) or not SLOT.match(p[1]) or not p[2].isdigit():
+            return self.send(404, "not found", "text/plain")
+        row = db("select sha from revs where user=? and game=? and slot=? and rev=?",
+                 (user["id"], p[0], p[1], int(p[2])), one=True)
+        if not row:
+            return self.send(404, "not found", "text/plain")
+        with open(blob_path(row[0]), "rb") as f:
+            data = f.read()
+        fn = re.sub(r"[^A-Za-z0-9 _.()-]", "_", f"{p[0]}-{p[1]}-r{p[2]}.sav")
+        self.send(200, data, "application/octet-stream", [("Content-Disposition", f'attachment; filename="{fn}"')])
+
+    def game_title(self, uid, game, slot):
+        g = db("select title from games where user=? and game=?", (uid, game), one=True)
+        if g and g[0]:
+            return g[0]
+        if game in SYSTEMS:  # ROM name: drop region/version tags like "(USA, Europe)"
+            return re.sub(r"\s*[(\[][^)\]]*[)\]]", "", slot).strip() or slot
+        return pretty(game)
+
+    # ---- JSON API for the website ------------------------------------------------
+    def web_api(self, method, p, q):
+        # Cross-site forms can't set custom headers: require one on every change.
+        if method != "GET" and self.headers.get("X-SaveServ") != "1":
+            return self.err(403, "missing X-SaveServ header")
+        now = int(time.time())
         users = db("select count(*) from users", one=True)[0]
-        if p == ["register"]:
-            allowed = REGISTER == "open" or users == 0
-            if not allowed:
-                return self.html("Register", "<section>Registration is closed. Ask the owner to add you "
-                                 "from their Account page.</section>")
-            err = ""
-            if method == "POST":
-                f = self.form()
-                name, pw = f.get("name", "").strip(), f.get("pw", "")
-                if not USER.match(name):
-                    err = "Use letters, numbers, dot, dash or underscore."
-                elif len(pw) < 6:
-                    err = "Password must be at least 6 characters."
-                elif db("select 1 from users where name=?", (name,)):
-                    err = "That name is taken."
-                else:
-                    db("insert into users(name, pw, created) values(?,?,?)", (name, hash_pw(pw), int(time.time())))
-                    uid = db("select id from users where name=?", (name,), one=True)[0]
-                    return self.redirect("/pair", [self.login(uid)])
-            return self.html("Register", self.account_form("Create account", "/register", err))
-        if p == ["login"]:
-            err = ""
-            if method == "POST":
-                f = self.form()
-                row = db("select id, pw from users where name=?", (f.get("name", "").strip(),), one=True)
-                if row and check_pw(f.get("pw", ""), row[1]):
-                    return self.redirect(q.get("next", "/"), [self.login(row[0])])
-                err = "Wrong name or password."
-            if users == 0:
-                return self.redirect("/register")
-            extra = '<p class=dim>No account? <a href="/register">Register</a></p>' if REGISTER == "open" else ""
-            return self.html("Log in", self.account_form("Log in", "/login", err) + extra)
-        if p == ["logout"]:
-            return self.redirect("/login", [("Set-Cookie", "sid=; Path=/; Max-Age=0")])
+        if p == ["status"]:
+            return self.send(200, {"users": users, "register": REGISTER == "open" or users == 0})
+        if p == ["register"] and method == "POST":
+            if not (REGISTER == "open" or users == 0):
+                return self.err(403, "Registration is closed. Ask the owner to add you.")
+            f = self.json_body()
+            name, pw = str(f.get("name", "")).strip(), str(f.get("password", ""))
+            if not USER.match(name):
+                return self.err(400, "Use letters, numbers, dot, dash or underscore.")
+            if len(pw) < 8:
+                return self.err(400, "Password must be at least 8 characters.")
+            if db("select 1 from users where name=?", (name,)):
+                return self.err(400, "That name is taken.")
+            db("insert into users(name, pw, created) values(?,?,?)", (name, hash_pw(pw), now))
+            uid = db("select id from users where name=?", (name,), one=True)[0]
+            return self.send(200, {"ok": True}, headers=[self.login(uid)])
+        if p == ["login"] and method == "POST":
+            f = self.json_body()
+            row = db("select id, pw from users where name=?", (str(f.get("name", "")).strip(),), one=True)
+            if not row or not check_pw(str(f.get("password", "")), row[1]):
+                time.sleep(0.5)
+                return self.err(401, "Wrong name or password.")
+            return self.send(200, {"ok": True}, headers=[self.login(row[0])])
+
+        user = self.session()
         if not user:
-            return self.redirect("/register" if users == 0 else "/login")
-        uid = user[0]
+            return self.err(401, "log in first")
+        uid = user["id"]
+        owner = db("select min(id) from users", one=True)[0] == uid
 
-        if p == ["pair"]:
-            msg = err = ""
-            if method == "POST":
-                pin = re.sub(r"\D", "", self.form().get("pin", ""))
-                now = int(time.time())
-                with PAIRS_LOCK:
-                    hit = next((k for k, v in PAIRS.items()
-                                if v["pin"] == pin and v["expires"] >= now and not v["token"]), None)
-                    if hit:
-                        tok = secrets.token_urlsafe(32)
-                        pr = PAIRS[hit]
-                        db("insert into devices(user, name, token, created, seen) values(?,?,?,?,?)",
-                           (uid, pr["name"], sha(tok.encode()), now, now))
-                        pr["token"], pr["account"] = tok, user[1]
-                        msg = f"Paired {html.escape(pr['name'])}. It will finish on its own in a few seconds."
-                    else:
-                        err = "No device is waiting with that PIN. Check the number or start pairing again."
-                        time.sleep(1)  # slow down guessing
-            body = f"""<section><h2 style="margin-top:0">Pair a device</h2>
-<p class=dim>On the device, choose <b>Pair</b> in its save sync menu (FFTA handheld: start screen, <b>Save Sync</b>,
-<b>Pair this device</b>; command line: <code>saveserv pair</code>). Type the 6-digit PIN it shows.</p>
-<form method=post><input class=pin name=pin inputmode=numeric autocomplete=off maxlength=7
- placeholder="000000" autofocus> <button>Pair</button></form>
-<p class=msg>{msg}</p><p class=err>{err}</p></section>"""
-            return self.html("Pair device", body, user)
+        if p == ["logout"] and method == "POST":
+            db("delete from sessions where token=?", (user["token"],))
+            return self.send(200, {"ok": True}, headers=[("Set-Cookie", "sid=; Path=/; Max-Age=0")])
+        if p == ["me"]:
+            row = db("select avatar from users where id=?", (uid,), one=True)
+            return self.send(200, {"id": uid, "name": user["name"], "display": user["display"], "owner": owner,
+                                   "avatar": f"/avatar/{uid}?v={(row[0] or 'none')[:8]}"})
 
-        if p == ["devices"]:
-            if method == "POST":
-                did = self.form().get("remove")
-                db("delete from devices where id=? and user=?", (did, uid))
-                return self.redirect("/devices")
-            rows = db("select id, name, created, seen from devices where user=? order by seen desc", (uid,))
-            tr = "".join(f"<tr><td>{html.escape(n)}</td><td class=dim>paired {ago(c)}</td><td class=dim>seen {ago(s)}</td>"
-                         f"<td><form class=inline method=post><button class=link name=remove value={i}>Unpair</button></form></td></tr>"
-                         for i, n, c, s in rows) or "<tr><td class=dim>No devices yet. <a href='/pair'>Pair one.</a></td></tr>"
-            return self.html("Devices", f"<section><h2 style='margin-top:0'>Devices</h2><table>{tr}</table></section>", user)
-
-        if p == ["account"]:
-            msg = ""
-            if method == "POST":
-                f = self.form()
-                if f.get("action") == "adduser":
-                    name, pw = f.get("name", "").strip(), f.get("pw", "")
-                    if USER.match(name) and len(pw) >= 6 and not db("select 1 from users where name=?", (name,)):
-                        db("insert into users(name, pw, created) values(?,?,?)", (name, hash_pw(pw), int(time.time())))
-                        msg = f"Added {html.escape(name)}."
-                    else:
-                        msg = "Could not add: name taken or invalid, or password under 6 characters."
-                elif f.get("action") == "password" and len(f.get("pw", "")) >= 6:
-                    db("update users set pw=? where id=?", (hash_pw(f["pw"]), uid))
-                    msg = "Password changed."
-            body = f"""<section><h2 style="margin-top:0">Account: {html.escape(user[1])}</h2>
-<form method=post><input type=hidden name=action value=password><label>New password</label>
-<input type=password name=pw minlength=6> <button>Change</button></form></section>
-<section><h2 style="margin-top:0">Add another account</h2><p class=dim>Each account has its own saves.</p>
-<form method=post><input type=hidden name=action value=adduser><label>Name</label><input name=name>
-<label>Password</label><input type=password name=pw minlength=6><p><button>Add account</button></p></form></section>
-<p class=msg>{msg}</p><p><a href="/logout">Log out</a></p>"""
-            return self.html("Account", body, user)
-
-        if len(p) == 4 and p[0] == "download" and NAME.match(p[1]) and SLOT.match(p[2]):
-            row = db("select sha from revs where user=? and game=? and slot=? and rev=?",
-                     (uid, p[1], p[2], int(p[3])), one=True)
-            if not row:
-                return self.send(404, "not found", "text/plain")
-            with open(blob_path(row[0]), "rb") as f:
-                data = f.read()
-            fn = re.sub(r'[^A-Za-z0-9 _.()-]', '_', f"{p[1]}-{p[2]}-r{p[3]}.sav")
-            return self.send(200, data, "application/octet-stream",
-                             [("Content-Disposition", f'attachment; filename="{fn}"')])
-
-        if p == ["restore"] and method == "POST":
-            # Re-publish an old revision as the newest one; devices pull it on next sync.
-            f = self.form()
-            game, slot, rev = f.get("game", ""), f.get("slot", ""), int(f.get("rev", "0"))
-            if NAME.match(game) and SLOT.match(slot):
+        if p == ["saves"]:
+            rows = db("""select game, slot, rev, size, created, device,
+                           (select count(*) from revs x where x.user=r.user and x.game=r.game and x.slot=r.slot)
+                         from revs r where user=?
+                         and rev=(select max(rev) from revs where user=r.user and game=r.game and slot=r.slot)""",
+                      (uid,))
+            out = []
+            for g, s, r, n, t, d, count in rows:
+                out.append(self.save_card(uid, g, s) | {
+                    "rev": r, "size": n, "updated": t, "device": d, "revisions": count})
+            return self.send(200, out)
+        if len(p) >= 3 and p[0] == "saves" and NAME.match(p[1]) and SLOT.match(p[2]):
+            g, s = p[1], p[2]
+            if len(p) == 3 and method == "GET":
+                rows = db("select rev, size, created, device, sha from revs where user=? and game=? and slot=? "
+                          "order by rev desc", (uid, g, s))
+                if not rows:
+                    return self.err(404, "no such save")
+                revs = [{"rev": r, "size": n, "updated": t, "device": d, "sha256": h} for r, n, t, d, h in rows]
+                return self.send(200, self.save_card(uid, g, s) | {"current": revs[0], "history": revs[1:]})
+            if p[3:] == ["restore"] and method == "POST":
+                rev = int(self.json_body().get("rev", 0))
                 with DB_LOCK:
                     old = DB.execute("select sha, size from revs where user=? and game=? and slot=? and rev=?",
-                                     (uid, game, slot, rev)).fetchone()
+                                     (uid, g, s, rev)).fetchone()
                     top = DB.execute("select max(rev) from revs where user=? and game=? and slot=?",
-                                     (uid, game, slot)).fetchone()[0]
-                    if old:
-                        DB.execute("insert into revs values(?,?,?,?,?,?,?,?)",
-                                   (uid, game, slot, top + 1, old[0], old[1], f"restored r{rev}", int(time.time())))
-                        DB.commit()
-            return self.redirect(f"/?slot={quote(game, safe='')}/{quote(slot, safe='')}")
+                                     (uid, g, s)).fetchone()[0]
+                    if not old:
+                        return self.err(404, "no such revision")
+                    DB.execute("insert into revs values(?,?,?,?,?,?,?,?)",
+                               (uid, g, s, top + 1, old[0], old[1], f"restored r{rev}", now))
+                    DB.commit()
+                prune(uid, g, s)
+                return self.send(200, {"rev": top + 1})
+            if p[3:] == ["title"] and method == "POST":
+                title = str(self.json_body().get("title", "")).strip()[:80] or None
+                row = db("select cover from meta where user=? and game=? and slot=?", (uid, g, s), one=True)
+                db("insert or replace into meta values(?,?,?,?,?)", (uid, g, s, title, row[0] if row else None))
+                return self.send(200, {"ok": True})
+            if p[3:4] == ["cover"]:
+                target = "*" if q.get("scope") == "game" else s
+                row = db("select title, cover from meta where user=? and game=? and slot=?", (uid, g, target), one=True)
+                old = row[1] if row else None
+                if method == "PUT":
+                    data = self.body(MAX_IMAGE)
+                    if not image_type(data):
+                        return self.err(400, "Use a PNG, JPEG, GIF or WebP image.")
+                    db("insert or replace into meta values(?,?,?,?,?)",
+                       (uid, g, target, row[0] if row else None, put_blob(data)))
+                elif method == "DELETE":
+                    db("update meta set cover=null where user=? and game=? and slot=?", (uid, g, target))
+                else:
+                    return self.err(405, "method")
+                if old:
+                    drop_blob_if_unused(old)
+                return self.send(200, {"ok": True})
+            return self.err(404, "not found")
 
-        if p == []:
-            rows = db("""select game, slot, rev, size, created, device from revs r where user=?
-                         and rev=(select max(rev) from revs where user=r.user and game=r.game and slot=r.slot)
-                         order by game, created desc""", (uid,))
-            if not rows:
-                devs = db("select count(*) from devices where user=?", (uid,), one=True)[0]
-                hint = "Play on a paired device and its saves appear here." if devs else \
-                    "No devices yet. <a href='/pair'>Pair one</a> to start syncing."
-                return self.html("Saves", f"<section>{hint}</section>", user)
-            out, game = [], None
-            for g, s, r, n, t, d in rows:
-                if g != game:
-                    if game is not None:
-                        out.append("</table></section>")
-                    out.append(f"<section><h2 style='margin-top:0'>{html.escape(g)}</h2><table>"
-                               "<tr><th>Save</th><th>Updated</th><th>From</th><th></th></tr>")
-                    game = g
-                out.append(f"<tr><td><a href='/?slot={quote(g, safe='')}/{quote(s, safe='')}'>{html.escape(s)}</a></td><td>{ago(t)}</td>"
-                           f"<td class=dim>{html.escape(d)}</td><td><a href='/download/{quote(g, safe='')}/{quote(s, safe='')}/{r}'>download</a></td></tr>")
-            out.append("</table></section>")
-            sel = q.get("slot", "")  # "<game>/<slot>"
-            if "/" in sel:
-                g, s = sel.split("/", 1)
-                hist = db("select rev, size, created, device from revs where user=? and game=? and slot=? order by rev desc",
-                          (uid, g, s))
-                tr = "".join(
-                    f"<tr><td>r{r}</td><td>{ago(t)}</td><td class=dim>{html.escape(d)}</td>"
-                    f"<td><a href='/download/{quote(g, safe='')}/{quote(s, safe='')}/{r}'>download</a></td><td>"
-                    + ("" if i == 0 else
-                       f"<form class=inline method=post action=/restore><input type=hidden name=game value='{html.escape(g)}'>"
-                       f"<input type=hidden name=slot value='{html.escape(s)}'><input type=hidden name=rev value={r}>"
-                       f"<button class=link style='color:var(--hi)'>restore</button></form>")
-                    + "</td></tr>" for i, (r, n, t, d) in enumerate(hist))
-                out.append(f"<section><h2 style='margin-top:0'>History: {html.escape(g)} / {html.escape(s)}</h2>"
-                           f"<p class=dim>Restore makes an old copy the newest; devices pick it up next time they sync.</p>"
-                           f"<table>{tr}</table></section>")
-            return self.html("Saves", "".join(out), user)
-        return self.send(404, "not found", "text/plain")
+        if p == ["pair"] and method == "POST":
+            pin = re.sub(r"\D", "", str(self.json_body().get("pin", "")))
+            with PAIRS_LOCK:
+                hit = next((k for k, v in PAIRS.items()
+                            if v["pin"] == pin and v["expires"] >= now and not v["token"]), None)
+                if hit:
+                    tok = secrets.token_urlsafe(32)
+                    pr = PAIRS[hit]
+                    db("insert into devices(user, name, token, created, seen) values(?,?,?,?,?)",
+                       (uid, pr["name"], sha(tok.encode()), now, now))
+                    pr["token"], pr["account"] = tok, user["name"]
+                    return self.send(200, {"device": pr["name"]})
+            time.sleep(1)  # slow down guessing
+            return self.err(404, "No device is waiting with that PIN. Check the number, or start pairing again.")
 
-    def account_form(self, title, action, err):
-        return f"""<section><h2 style="margin-top:0">{title}</h2><form method=post action="{action}">
-<label>Name</label><input name=name autofocus autocomplete=username>
-<label>Password</label><input type=password name=pw autocomplete=current-password>
-<p><button>{title}</button></p><p class=err>{err}</p></form></section>"""
+        if p == ["devices"]:
+            rows = db("select id, name, created, seen from devices where user=? order by seen desc", (uid,))
+            return self.send(200, [{"id": i, "name": n, "created": c, "seen": s} for i, n, c, s in rows])
+        if len(p) == 3 and p[0] == "devices" and p[1].isdigit() and p[2] == "remove" and method == "POST":
+            db("delete from devices where id=? and user=?", (int(p[1]), uid))
+            return self.send(200, {"ok": True})
+
+        if p == ["profile"] and method == "POST":
+            display = str(self.json_body().get("display", "")).strip()[:40] or None
+            db("update users set display=? where id=?", (display, uid))
+            return self.send(200, {"ok": True})
+        if p == ["avatar"]:
+            old = db("select avatar from users where id=?", (uid,), one=True)[0]
+            if method == "PUT":
+                data = self.body(MAX_IMAGE)
+                if not image_type(data):
+                    return self.err(400, "Use a PNG, JPEG, GIF or WebP image.")
+                db("update users set avatar=? where id=?", (put_blob(data), uid))
+            elif method == "DELETE":
+                db("update users set avatar=null where id=?", (uid,))
+            else:
+                return self.err(405, "method")
+            drop_blob_if_unused(old)
+            return self.send(200, {"ok": True})
+        if p == ["password"] and method == "POST":
+            f = self.json_body()
+            pw = db("select pw from users where id=?", (uid,), one=True)[0]
+            if not check_pw(str(f.get("current", "")), pw):
+                time.sleep(0.5)
+                return self.err(400, "Your current password is wrong.")
+            new = str(f.get("new", ""))
+            if len(new) < 8:
+                return self.err(400, "The new password must be at least 8 characters.")
+            db("update users set pw=? where id=?", (hash_pw(new), uid))
+            db("delete from sessions where user=? and token<>?", (uid, user["token"]))
+            return self.send(200, {"ok": True})
+        if p == ["sessions"]:
+            rows = db("select token, created, seen, agent from sessions where user=? order by seen desc", (uid,))
+            return self.send(200, [{"current": t == user["token"], "created": c, "seen": s or c, "agent": a or ""}
+                                   for t, c, s, a in rows])
+        if p == ["sessions", "revoke-others"] and method == "POST":
+            db("delete from sessions where user=? and token<>?", (uid, user["token"]))
+            return self.send(200, {"ok": True})
+
+        if p == ["accounts"] and owner:
+            if method == "POST":
+                f = self.json_body()
+                name, pw = str(f.get("name", "")).strip(), str(f.get("password", ""))
+                if not USER.match(name) or len(pw) < 8 or db("select 1 from users where name=?", (name,)):
+                    return self.err(400, "Name taken or invalid, or password under 8 characters.")
+                db("insert into users(name, pw, created) values(?,?,?)", (name, hash_pw(pw), now))
+            rows = db("select id, name, display, created from users order by id")
+            return self.send(200, [{"id": i, "name": n, "display": d or n, "created": c} for i, n, d, c in rows])
+        return self.err(404, "not found")
+
+    def save_card(self, uid, game, slot):
+        """Title, version label and cover URL of one save."""
+        m = db("select title, cover from meta where user=? and game=? and slot=?", (uid, game, slot), one=True)
+        gm = db("select cover from meta where user=? and game=? and slot='*'", (uid, game), one=True)
+        title = self.game_title(uid, game, slot)
+        version = (m[0] if m and m[0] else (None if game in SYSTEMS else pretty(slot)))
+        if game in SYSTEMS and m and m[0]:
+            title, version = m[0], None
+        stamp = ((m[1] if m else None) or (gm[0] if gm else None) or "auto")[:8]
+        return {"game": game, "slot": slot, "title": title, "version": version,
+                "system": game if game in SYSTEMS else None,
+                "cover": f"/cover/{quote(game, safe='')}/{quote(slot, safe='')}?v={stamp}"}
 
 
 if __name__ == "__main__":
