@@ -36,6 +36,8 @@ const ICONS = {
   restore: "M4 12a8 8 0 1 0 2.5-5.8M4 4v5h5",
   edit: "M4 20h4L19 9l-4-4L4 16v4Z",
   image: "M4 5h16v14H4zM8 11a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM20 16l-5-5-9 8",
+  trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5M14 11v5",
+  back: "M15 6l-6 6 6 6",
 };
 function icon(name, cls = "ico") {
   return h("svg", { class: cls, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor",
@@ -149,31 +151,57 @@ function topbar() {
     h("div", { class: "user" }, btn, menu));
 }
 
+// One cover per game, its slots inside. Emulator folders stay one cover per slot,
+// because there each slot is a different game.
+const tileKey = (s) => (s.system ? `${s.game}/${s.slot}` : s.game);
+
+function groups(saves) {
+  const byKey = new Map();
+  for (const s of saves) {
+    const k = tileKey(s);
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(s);
+  }
+  return [...byKey].map(([key, slots]) => {
+    slots.sort((a, b) => b.updated - a.updated);
+    return { key, slots, newest: slots[0], title: slots[0].title, game: slots[0].game };
+  });
+}
+
 function sorted() {
   const q = state.query.trim().toLowerCase();
-  let list = state.saves.filter((s) =>
+  const list = groups(state.saves.filter((s) =>
     (!q || `${s.title} ${s.version || ""} ${s.game} ${s.slot}`.toLowerCase().includes(q)) &&
-    (!state.device || s.device === state.device));
+    (!state.device || s.device === state.device)));
   const by = {
-    recent: (a, b) => b.updated - a.updated,
-    name: (a, b) => a.title.localeCompare(b.title) || (a.version || "").localeCompare(b.version || ""),
-    game: (a, b) => a.game.localeCompare(b.game) || a.title.localeCompare(b.title) || (a.version || "").localeCompare(b.version || ""),
+    recent: (a, b) => b.newest.updated - a.newest.updated,
+    name: (a, b) => a.title.localeCompare(b.title),
+    game: (a, b) => a.game.localeCompare(b.game) || a.title.localeCompare(b.title),
   }[state.sort];
   return list.sort(by);
 }
 
-function tile(s) {
-  const t = h("button", { class: "tile" + (state.open && state.open.game === s.game && state.open.slot === s.slot ? " open" : ""),
-    "data-key": `${s.game}/${s.slot}`, onclick: () => openSave(s) },
+function tile(g) {
+  const s = g.newest;
+  const many = g.slots.length > 1;
+  // ("Save" is what a whole synced folder's only slot is called: nothing to tell apart)
+  const label = many ? `${g.slots.length} saves` : s.version && s.version !== "Save" ? s.version : null;
+  const t = h("button", { class: "tile" + (state.open && tileKey(state.open) === g.key ? " open" : ""),
+    "data-key": g.key, onclick: () => openTile(g) },
     h("div", { class: "cover" },
       h("img", { src: s.cover, alt: "", loading: "lazy" }),
-      s.version ? h("span", { class: "badge" }, s.version) : null,
+      label ? h("span", { class: "badge" }, label) : null,
       s.system ? h("span", { class: "badge sys" }, s.system) : null),
     h("div", { class: "cap" },
-      h("div", { class: "t" }, s.title),
+      h("div", { class: "t" }, g.title),
       h("div", { class: "s" }, `${ago(s.updated)} · ${s.device}`)));
-  t.setAttribute("aria-label", `${s.title}${s.version ? " " + s.version : ""}, synced ${ago(s.updated)} from ${s.device}`);
+  t.setAttribute("aria-label", `${g.title}${label ? ", " + label : ""}, synced ${ago(s.updated)} from ${s.device}`);
   return t;
+}
+
+function openTile(g) {
+  if (g.slots.length > 1) openGame(g.game);
+  else openSave(g.newest);
 }
 
 function renderGrid() {
@@ -188,7 +216,7 @@ function renderGrid() {
     h("div", { class: "cap" }, h("div", { class: "t" }, "Pair a device"), h("div", { class: "s" }, "Enter its PIN"))));
   grid.replaceChildren(...kids);
   const count = document.querySelector(".toolbar h1 small");
-  if (count) count.textContent = state.saves.length ? `${state.saves.length}` : "";
+  if (count) count.textContent = state.saves.length ? `${groups(state.saves).length}` : "";
 }
 
 function renderMain() {
@@ -227,7 +255,8 @@ document.addEventListener("keydown", (e) => {
 // ---- save drawer -------------------------------------------------------------------
 async function openSave(s) {
   state.open = s;
-  document.querySelectorAll(".tile").forEach((t) => t.classList.toggle("open", t.dataset.key === `${s.game}/${s.slot}`));
+  document.querySelectorAll(".tile").forEach((t) => t.classList.toggle("open", t.dataset.key === tileKey(s)));
+  const fromGame = !s.system && state.saves.filter((x) => x.game === s.game).length > 1;
   let d;
   try { d = await api(`/web/saves/${encodeURIComponent(s.game)}/${encodeURIComponent(s.slot)}`); }
   catch (x) { toast(x.message); return; }
@@ -263,6 +292,18 @@ async function openSave(s) {
       toast("Cover reset"); await refresh(); openSave(state.saves.find((x) => x.game === s.game && x.slot === s.slot) || s);
     } catch (x) { toast(x.message); }
   }
+  async function remove() {
+    const n = d.history.length + 1;
+    if (!confirm(`Delete "${d.title}${d.version ? " · " + d.version : ""}" and its ${n} revision${n === 1 ? "" : "s"} from the server? This can't be undone.\n\nFiles on your devices aren't touched. A device holding this exact save won't upload it again, but its next new save will bring the entry back.`)) return;
+    try {
+      await api(base, { method: "DELETE" });
+      toast("Save deleted");
+      closeDrawer();
+      await refresh();
+      const left = !s.system && state.saves.filter((x) => x.game === s.game);
+      if (left && left.length > 1) openGame(s.game);
+    } catch (x) { toast(x.message); }
+  }
   async function rename() {
     const title = prompt(d.system ? "Name for this save" : "Name for this version", d.version || d.title);
     if (title === null) return;
@@ -279,6 +320,7 @@ async function openSave(s) {
         h("div", { class: "chips" },
           d.version ? h("span", { class: "chip" }, d.version) : null,
           h("span", { class: "chip" }, d.system ? `${d.system.toUpperCase()} · ${d.slot}` : `${d.game} / ${d.slot}`))),
+      fromGame ? h("button", { class: "btn small back", onclick: () => openGame(s.game), "aria-label": "All saves of this game" }, icon("back")) : null,
       h("button", { class: "btn small close", onclick: closeDrawer, "aria-label": "Close" }, icon("x"))),
     h("div", { class: "body" },
       h("section", {}, h("h3", {}, "Current save"),
@@ -298,15 +340,55 @@ async function openSave(s) {
           h("button", { class: "btn small", onclick: () => setCover("slot") }, icon("image"), d.system ? "Change cover" : "Cover for this version"),
           d.system ? null : h("button", { class: "btn small", onclick: () => setCover("game") }, icon("image"), "Cover for every version"),
           h("button", { class: "btn small", onclick: rename }, icon("edit"), "Rename"),
-          h("button", { class: "btn small", onclick: resetCover }, "Reset cover")))));
+          h("button", { class: "btn small", onclick: resetCover }, "Reset cover"))),
+      h("section", {}, h("h3", {}, "Delete"),
+        h("button", { class: "btn small danger", onclick: remove }, icon("trash"), "Delete this save"))));
   const scrim = h("div", { class: "scrim", onclick: closeDrawer });
   document.body.append(scrim, drawer);
   drawer.querySelector(".close").focus();
 }
 
+// A game with several slots: pick one, or delete them all.
+function openGame(game) {
+  const slots = state.saves.filter((x) => x.game === game).sort((a, b) => b.updated - a.updated);
+  if (!slots.length) return;
+  const first = slots[0];
+  closeDrawer();
+  state.open = first;
+  document.querySelectorAll(".tile").forEach((t) => t.classList.toggle("open", t.dataset.key === tileKey(first)));
+  async function removeAll() {
+    const revs = slots.reduce((n, x) => n + x.revisions, 0);
+    if (!confirm(`Delete all ${slots.length} saves of "${first.title}" and their ${revs} revisions from the server? This can't be undone.\n\nFiles on your devices aren't touched. A device holding these exact saves won't upload them again, but its next new save will bring the entry back.`)) return;
+    try {
+      await api(`/web/saves/${encodeURIComponent(game)}`, { method: "DELETE" });
+      toast("Saves deleted");
+      closeDrawer();
+      await refresh();
+    } catch (x) { toast(x.message); }
+  }
+  const drawer = h("aside", { class: "drawer", role: "dialog", "aria-modal": "true", "aria-label": first.title },
+    h("header", {},
+      h("div", { class: "cover" }, h("img", { src: first.cover, alt: "" })),
+      h("div", { style: "min-width:0" },
+        h("h2", {}, first.title),
+        h("div", { class: "chips" }, h("span", { class: "chip" }, `${slots.length} saves`), h("span", { class: "chip" }, game))),
+      h("button", { class: "btn small close", onclick: closeDrawer, "aria-label": "Close" }, icon("x"))),
+    h("div", { class: "body" },
+      h("section", {}, h("h3", {}, "Saves"),
+        h("ul", { class: "revs" }, ...slots.map((x) => h("li", {},
+          h("div", { class: "info" },
+            h("div", {}, h("strong", {}, x.version || x.slot)),
+            h("div", { title: when(x.updated) }, `${ago(x.updated)} · ${x.device} · ${size(x.size)}`)),
+          h("button", { class: "btn small", onclick: () => openSave(x) }, "Open"))))),
+      h("section", {}, h("h3", {}, "Delete"),
+        h("button", { class: "btn small danger", onclick: removeAll }, icon("trash"), "Delete all saves of this game"))));
+  document.body.append(h("div", { class: "scrim", onclick: closeDrawer }), drawer);
+  drawer.querySelector(".close").focus();
+}
+
 function closeDrawer() {
   document.querySelectorAll(".drawer, .scrim").forEach((el) => el.remove());
-  const key = state.open && `${state.open.game}/${state.open.slot}`;
+  const key = state.open && tileKey(state.open);
   state.open = null;
   document.querySelectorAll(".tile.open").forEach((t) => t.classList.remove("open"));
   const back = key && [...document.querySelectorAll(".tile")].find((t) => t.dataset.key === key);

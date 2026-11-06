@@ -12,7 +12,9 @@ Saves are addressed as <game>/<slot>: a recomp uses its game id and version
 (USA)). Every upload is kept as a new revision (the last KEEP per slot):
   GET  /api/saves/<game>               {"slot": {"rev","sha256","size","updated","device"}}
   GET  /api/saves/<game>/<slot>        bytes (headers X-Rev, X-Sha256)
-  PUT  /api/saves/<game>/<slot>?base=N bytes; 409 unless N is the current rev (0 = none)
+  PUT  /api/saves/<game>/<slot>?base=N bytes; 409 unless N is the current rev (0 = none);
+                                       410 if these exact bytes were deleted on the website
+                                       and the slot is still empty (&undelete=1 overrides)
   PUT  /api/meta/<game>                {"title", "system", "rom", "slots": {"remix": "Remix"}}
        optional: how the website names the game and finds its box art
 
@@ -52,6 +54,7 @@ THUMBNAILS = os.environ.get("SAVESERV_THUMBNAILS", "1") != "0"
 WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 MAX_SAVE = 16 << 20
 MAX_IMAGE = 3 << 20
+MAX_DELETED = 200  # hashes remembered per slot, newest kept
 PIN_TTL = 600
 NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 # Slots may be ROM-style file names ("Golden Sun (USA)"), but no path parts.
@@ -83,6 +86,8 @@ create table if not exists meta(user int, game text, slot text, title text, cove
 create table if not exists games(user int, game text, title text, system text, rom text,
                                  primary key(user, game));
 create table if not exists thumbs(key text primary key, sha text, fetched int);
+create table if not exists deleted(user int, game text, slot text, sha text, created int,
+                                   primary key(user, game, slot, sha));
 """)
 for table, column in (("users", "display text"), ("users", "avatar text"),
                       ("sessions", "agent text"), ("sessions", "seen int")):
@@ -152,6 +157,33 @@ def prune(user, game, slot):
     for rev, digest in old:
         db("delete from revs where user=? and game=? and slot=? and rev=?", (user, game, slot, rev))
         drop_blob_if_unused(digest)
+
+
+def delete_slot(user, game, slot):
+    """A save and every revision of it, gone for good. Returns how many revisions
+    went, 0 if there was no such save. Once a game has no saves left, its name
+    and covers go too. Website only: a device token can't do this."""
+    shas = [r[0] for r in db("select sha from revs where user=? and game=? and slot=?", (user, game, slot))]
+    if not shas:
+        return 0
+    covers = [r[0] for r in db("select cover from meta where user=? and game=? and slot=?", (user, game, slot))]
+    # Only the hashes stay, so a device still holding one of these saves doesn't
+    # bring it straight back. A new save has a new hash, and uploads as normal.
+    now = int(time.time())
+    for digest in set(shas):
+        db("insert or replace into deleted values(?,?,?,?,?)", (user, game, slot, digest, now))
+    db("""delete from deleted where user=? and game=? and slot=? and sha not in
+          (select sha from deleted where user=? and game=? and slot=? order by created desc limit ?)""",
+       (user, game, slot, user, game, slot, MAX_DELETED))
+    db("delete from revs where user=? and game=? and slot=?", (user, game, slot))
+    db("delete from meta where user=? and game=? and slot=?", (user, game, slot))
+    if not db("select 1 from revs where user=? and game=? limit 1", (user, game)):
+        covers += [r[0] for r in db("select cover from meta where user=? and game=?", (user, game))]
+        db("delete from meta where user=? and game=?", (user, game))
+        db("delete from games where user=? and game=?", (user, game))
+    for digest in set(shas + covers):
+        drop_blob_if_unused(digest)
+    return len(shas)
 
 
 IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", "image/png"), (b"\xff\xd8\xff", "image/jpeg"),
@@ -446,6 +478,14 @@ class Handler(BaseHTTPRequestHandler):
                 digest = sha(data)
                 if row and row[1] == digest:
                     return self.send(200, {"rev": rev})
+                if not row:
+                    gone = DB.execute("select 1 from deleted where user=? and game=? and slot=? and sha=?",
+                                      (uid, game, slot, digest)).fetchone()
+                    if gone and q.get("undelete") != "1":
+                        return self.send(410, {"error": "this save was deleted on the website"})
+                    if gone:
+                        DB.execute("delete from deleted where user=? and game=? and slot=? and sha=?",
+                                   (uid, game, slot, digest))
                 if not os.path.exists(blob_path(digest)):
                     tmp = blob_path(digest) + ".tmp"
                     with open(tmp, "wb") as f:
@@ -575,8 +615,16 @@ class Handler(BaseHTTPRequestHandler):
                 out.append(self.save_card(uid, g, s) | {
                     "rev": r, "size": n, "updated": t, "device": d, "revisions": count})
             return self.send(200, out)
+        if len(p) == 2 and p[0] == "saves" and NAME.match(p[1]) and method == "DELETE":
+            slots = [r[0] for r in db("select distinct slot from revs where user=? and game=?", (uid, p[1]))]
+            if not slots:
+                return self.err(404, "no such game")
+            return self.send(200, {"saves": len(slots), "revisions": sum(delete_slot(uid, p[1], x) for x in slots)})
         if len(p) >= 3 and p[0] == "saves" and NAME.match(p[1]) and SLOT.match(p[2]):
             g, s = p[1], p[2]
+            if len(p) == 3 and method == "DELETE":
+                n = delete_slot(uid, g, s)
+                return self.send(200, {"revisions": n}) if n else self.err(404, "no such save")
             if len(p) == 3 and method == "GET":
                 rows = db("select rev, size, created, device, sha from revs where user=? and game=? and slot=? "
                           "order by rev desc", (uid, g, s))

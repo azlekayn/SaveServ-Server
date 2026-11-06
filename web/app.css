@@ -157,6 +157,8 @@ main { max-width: 1280px; margin: 0 auto; padding: 22px 24px 60px; }
 .drawer .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { padding: 2px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--line); font-size: 12px; color: var(--dim); }
 .drawer .close { margin-left: auto; align-self: flex-start; }
+.drawer .back { margin-left: auto; align-self: flex-start; }
+.drawer .back + .close { margin-left: 0; }
 .drawer .body { overflow: auto; padding: 18px; display: grid; gap: 18px; }
 .drawer h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .8px; color: var(--dim); margin: 0 0 8px; }
 .card { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
