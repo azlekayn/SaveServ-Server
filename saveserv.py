@@ -20,8 +20,8 @@ Saves are addressed as <game>/<slot>: a recomp uses its game id and version
 
 The website (server/web/) is a single page that talks to /web/* with the
 session cookie. Covers come from, in order: an uploaded cover for the save,
-an uploaded cover for the game, libretro box art (system + ROM name), and a
-generated tile.
+an uploaded cover for the game, libretro box art (system + ROM name), a search
+by title (Steam, SteamGridDB, IGDB; exact titles only), and a generated tile.
 
 Standard library only. Configuration (environment):
   SAVESERV_DATA       data directory (default /data)
@@ -29,7 +29,9 @@ Standard library only. Configuration (environment):
   SAVESERV_REGISTER   "open" lets anyone register; "first" (default) only the
                       first account, later accounts are added by the owner
   SAVESERV_KEEP       revisions kept per slot (default 50)
-  SAVESERV_THUMBNAILS "0" turns off fetching libretro box art
+  SAVESERV_THUMBNAILS "0" turns off every online cover lookup
+  SAVESERV_STEAMGRIDDB_KEY          adds SteamGridDB to the title search
+  SAVESERV_IGDB_ID, SAVESERV_IGDB_SECRET   a Twitch app's: adds IGDB to it
 """
 import hashlib
 import hmac
@@ -41,6 +43,8 @@ import secrets
 import sqlite3
 import threading
 import time
+import unicodedata
+import urllib.error
 import urllib.request
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +55,9 @@ PORT = int(os.environ.get("SAVESERV_PORT", "8787"))
 REGISTER = os.environ.get("SAVESERV_REGISTER", "first")
 KEEP = int(os.environ.get("SAVESERV_KEEP", "50"))
 THUMBNAILS = os.environ.get("SAVESERV_THUMBNAILS", "1") != "0"
+STEAMGRIDDB_KEY = os.environ.get("SAVESERV_STEAMGRIDDB_KEY", "")
+IGDB_ID = os.environ.get("SAVESERV_IGDB_ID", "")
+IGDB_SECRET = os.environ.get("SAVESERV_IGDB_SECRET", "")
 WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 MAX_SAVE = 16 << 20
 MAX_IMAGE = 3 << 20
@@ -201,8 +208,8 @@ INDEX = {}  # libretro folder -> (fetched, [names])
 INDEX_LOCK = threading.Lock()
 
 
-def fetch(url, limit):
-    req = urllib.request.Request(url, headers={"User-Agent": "SaveServ"})
+def fetch(url, limit, headers=None, data=None):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": "SaveServ", **(headers or {})})
     with urllib.request.urlopen(req, timeout=8) as r:
         return r.read(limit + 1)
 
@@ -256,6 +263,151 @@ def libretro_art(system, rom):
         except Exception as e:  # offline, 404: try the closest name, then a generated tile
             print(f"thumbnail {url}: {e}", flush=True)
     db("insert or replace into thumbs values(?,?,?)", (key, digest, int(time.time())))
+    return digest or None
+
+
+# ---- covers by title --------------------------------------------------------
+# Only the game's title leaves this server, and a cover is used only when a
+# source's name for the game is the same title: a wrong cover is worse than initials.
+
+SCRAPE_LOCK = threading.Lock()  # one lookup at a time: slots of a game share it, and a new page can't hammer anyone
+SOURCE_DOWN = {}  # source -> time to try it again (so an outage costs one timeout, not one per cover)
+IGDB_TOKEN = ("", 0)  # token, expires
+
+
+def title_key(title):
+    """What two names must share to be the same game: no accents, case or punctuation."""
+    t = re.sub("[\u2122\u2120\u00ae\u00a9]", "", title)  # (before NFKD turns the TM sign into letters)
+    t = unicodedata.normalize("NFKD", t).casefold().replace("&", "and")
+    return re.sub(r"[\W_]+", "", t)
+
+
+def same_title(name, title):
+    return bool(name) and title_key(name) == title_key(title)
+
+
+def fetch_json(url, headers=None, data=None):
+    try:
+        return json.loads(fetch(url, 1 << 20, headers, data))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:  # (SteamGridDB's answer for no such game)
+            return {}
+        raise
+
+
+def first_image(urls, host_suffix):
+    """The first of these that's really an image of a sane size. They come from
+    the source's answer, so only its own image host over https is fetched."""
+    for url in urls:
+        parsed = urlparse(url or "")
+        host = parsed.hostname or ""
+        if parsed.scheme != "https" or not (host == host_suffix or host.endswith("." + host_suffix)):
+            continue
+        try:
+            data = fetch(url, MAX_IMAGE)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:  # (not every game has every picture)
+                continue
+            raise
+        if len(data) <= MAX_IMAGE and image_type(data):
+            return data
+    return None
+
+
+def steam_cover(title):
+    found = fetch_json(f"https://store.steampowered.com/api/storesearch/?term={quote(title, safe='')}&l=english&cc=US")
+    for item in found.get("items", []):
+        if item.get("type") == "app" and same_title(item.get("name"), title):
+            # (The search's own picture has a hash in its path that's that picture's alone,
+            # so it can't lead to the others. It's small and wide: the last resort.)
+            base = f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{int(item['id'])}"
+            return first_image([f"{base}/library_600x900.jpg", f"{base}/header.jpg", item.get("tiny_image")], "steamstatic.com")
+    return None
+
+
+def steamgriddb_cover(title):
+    api, auth = "https://www.steamgriddb.com/api/v2", {"Authorization": f"Bearer {STEAMGRIDDB_KEY}"}
+    for game in fetch_json(f"{api}/search/autocomplete/{quote(title, safe='')}", auth).get("data", []):
+        if same_title(game.get("name"), title):
+            for shape in ("&dimensions=512x512,1024x1024", ""):  # the tiles are square; else whatever exists
+                grids = fetch_json(f"{api}/grids/game/{int(game['id'])}?types=static&nsfw=false&humor=false{shape}", auth).get("data", [])
+                art = first_image([u for g in grids[:3] for u in (g.get("url"), g.get("thumb"))], "steamgriddb.com")
+                if art:
+                    return art
+            return None
+    return None
+
+
+def igdb_cover(title):
+    global IGDB_TOKEN
+    if time.time() >= IGDB_TOKEN[1]:
+        # (The secret goes in the body: URLs end up in logs.)
+        form = f"client_id={quote(IGDB_ID, safe='')}&client_secret={quote(IGDB_SECRET, safe='')}&grant_type=client_credentials"
+        got = fetch_json("https://id.twitch.tv/oauth2/token", data=form.encode())
+        IGDB_TOKEN = (got["access_token"], time.time() + int(got.get("expires_in", 3600)) - 60)
+    term = re.sub(r'["\\\x00-\x1f]', " ", title)
+    query = f'search "{term}"; fields name,alternative_names.name,cover.image_id; where cover != null; limit 20;'
+    try:
+        games = fetch_json("https://api.igdb.com/v4/games", {"Client-ID": IGDB_ID, "Authorization": f"Bearer {IGDB_TOKEN[0]}"}, query.encode())
+    except urllib.error.HTTPError as e:
+        if e.code == 401:  # revoked early: ask again next time
+            IGDB_TOKEN = ("", 0)
+        raise
+    for game in games if isinstance(games, list) else []:
+        names = [game.get("name")] + [a.get("name") for a in game.get("alternative_names", [])]
+        image = (game.get("cover") or {}).get("image_id")
+        if image and any(same_title(n, title) for n in names):
+            return first_image([f"https://images.igdb.com/igdb/image/upload/t_cover_big_2x/{quote(image, safe='')}.jpg"], "igdb.com")
+    return None
+
+
+def title_sources(retro):
+    """In order. Steam has no key to set, but has no old console games: for those,
+    its same-named remake or port would be the wrong cover."""
+    sources = [] if retro else [("steam", steam_cover)]
+    if STEAMGRIDDB_KEY:
+        sources.append(("steamgriddb", steamgriddb_cover))
+    if IGDB_ID and IGDB_SECRET:
+        sources.append(("igdb", igdb_cover))
+    return sources
+
+
+def title_art(title, retro=False):
+    """A cover found by title, cached (misses for a day, or an hour when a source
+    failed). The sources are part of the key: adding one looks again at once."""
+    sources = title_sources(retro)
+    wanted = title_key(title)
+    if not (THUMBNAILS and sources and wanted):
+        return None
+    key = f"title/{'+'.join(n for n, _ in sources)}/{wanted}"
+
+    def cached():
+        row = db("select sha, fetched from thumbs where key=?", (key,), one=True)
+        return row and (row[0] or time.time() - row[1] < 86400), row[0] if row else None
+
+    known, digest = cached()
+    if known:
+        return digest or None
+    with SCRAPE_LOCK:
+        known, digest = cached()
+        if known:
+            return digest or None
+        digest, failed, now = "", False, time.time()
+        for name, find in sources:
+            if SOURCE_DOWN.get(name, 0) > now:
+                failed = True
+                continue
+            try:
+                art = find(title)
+            except Exception as e:  # offline, rate limited, a bad key: the next source, then initials
+                print(f"cover {name}: {type(e).__name__}: {e}", flush=True)
+                SOURCE_DOWN[name], failed = now + 300, True
+                continue
+            if art:
+                digest = put_blob(art)
+                break
+        retry_at = now - 86400 + 3600 if failed and not digest else now
+        db("insert or replace into thumbs values(?,?,?)", (key, digest, int(retry_at)))
     return digest or None
 
 
@@ -515,12 +667,19 @@ class Handler(BaseHTTPRequestHandler):
             row = db("select cover from meta where user=? and game=? and slot=?", (uid, game, s), one=True)
             if row and row[0]:
                 return row[0]
-        g = db("select system, rom from games where user=? and game=?", (uid, game), one=True)
+        g = db("select system, rom, title from games where user=? and game=?", (uid, game), one=True)
+        art = None
         if g and g[0] and g[1]:
-            return libretro_art(g[0], g[1])
-        if game in SYSTEMS:  # emulator folder: the slot is the ROM name
-            return libretro_art(game, slot)
-        return None
+            art = libretro_art(g[0], g[1])
+        elif game in SYSTEMS:  # emulator folder: the slot is the ROM name
+            art = libretro_art(game, slot)
+        if art:
+            return art
+        title = self.game_title(uid, game, slot)
+        # A title nobody gave, from a short id like "za", isn't worth searching for.
+        if not (g and g[2]) and game not in SYSTEMS and len(title_key(title)) < 4:
+            return None
+        return title_art(title, game in SYSTEMS or bool(g and g[0] in SYSTEMS))
 
     def cover(self, user, p):
         if len(p) != 2 or not NAME.match(p[0]) or not SLOT.match(p[1]):
