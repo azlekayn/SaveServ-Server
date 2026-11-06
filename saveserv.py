@@ -50,7 +50,7 @@ REGISTER = os.environ.get("SAVESERV_REGISTER", "first")
 KEEP = int(os.environ.get("SAVESERV_KEEP", "50"))
 THUMBNAILS = os.environ.get("SAVESERV_THUMBNAILS", "1") != "0"
 WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
-MAX_SAVE = 4 << 20
+MAX_SAVE = 16 << 20
 MAX_IMAGE = 3 << 20
 PIN_TTL = 600
 NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
