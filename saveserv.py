@@ -32,6 +32,13 @@ Standard library only. Configuration (environment):
   SAVESERV_THUMBNAILS "0" turns off every online cover lookup
   SAVESERV_STEAMGRIDDB_KEY          adds SteamGridDB to the title search
   SAVESERV_IGDB_ID, SAVESERV_IGDB_SECRET   a Twitch app's: adds IGDB to it
+  SAVESERV_URL        the address devices should use (a reverse proxy's name);
+                      announced in /api/hello and to discovery probes
+
+Discovery: a UDP datagram "SAVESERV?" to the listen port (UDP) is answered
+with {"service": "saveserv", "version", "url", "port"}. Devices send it to
+every address of their network, so it works through Docker's port publishing
+("8787:8787/udp"), where broadcasts and multicast do not arrive.
 """
 import hashlib
 import hmac
@@ -40,6 +47,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import threading
 import time
@@ -55,6 +63,9 @@ PORT = int(os.environ.get("SAVESERV_PORT", "8787"))
 REGISTER = os.environ.get("SAVESERV_REGISTER", "first")
 KEEP = int(os.environ.get("SAVESERV_KEEP", "50"))
 THUMBNAILS = os.environ.get("SAVESERV_THUMBNAILS", "1") != "0"
+# The address devices should use (a reverse proxy's name), announced in /api/hello so a device that found the server
+# by scanning the network switches to it. Empty: the address the device used.
+URL = os.environ.get("SAVESERV_URL", "").strip().rstrip("/")
 STEAMGRIDDB_KEY = os.environ.get("SAVESERV_STEAMGRIDDB_KEY", "")
 IGDB_ID = os.environ.get("SAVESERV_IGDB_ID", "")
 IGDB_SECRET = os.environ.get("SAVESERV_IGDB_SECRET", "")
@@ -458,6 +469,15 @@ class Handler(BaseHTTPRequestHandler):
     def body(self, limit=MAX_SAVE):
         n = int(self.headers.get("Content-Length") or 0)
         if n > limit:
+            # Read it away (up to a bound), so the client, still sending, hears why instead of a reset connection.
+            left = n if n <= 4 * MAX_SAVE else 0
+            while left > 0:
+                got = self.rfile.read(min(left, 1 << 20))
+                if not got:
+                    break
+                left -= len(got)
+            if n > 4 * MAX_SAVE:
+                self.close_connection = True
             raise ValueError("too large")
         return self.rfile.read(n) if n else b""
 
@@ -554,7 +574,10 @@ class Handler(BaseHTTPRequestHandler):
     def api(self, method, p, q):
         now = int(time.time())
         if p == ["hello"]:
-            return self.send(200, {"service": "saveserv", "version": 2})
+            hello = {"service": "saveserv", "version": 2}
+            if URL:
+                hello["url"] = URL
+            return self.send(200, hello)
         if p == ["pair"] and method == "POST":
             req = json.loads(self.body(4096) or b"{}")
             name = str(req.get("name") or "device")[:40]
@@ -913,6 +936,25 @@ class Handler(BaseHTTPRequestHandler):
                 "cover": f"/cover/{quote(game, safe='')}/{quote(slot, safe='')}?v={stamp}"}
 
 
+def discovery():
+    """Answer "SAVESERV?" datagrams on the listen port (UDP) with where to find this server."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("", PORT))
+    except OSError as e:
+        print(f"saveserv: discovery off (UDP port {PORT}: {e})", flush=True)
+        return
+    reply = json.dumps({"service": "saveserv", "version": 2, "url": URL or None, "port": PORT}).encode()
+    while True:
+        try:
+            data, addr = sock.recvfrom(64)
+            if data.strip() == b"SAVESERV?":
+                sock.sendto(reply, addr)
+        except OSError:
+            time.sleep(0.1)
+
+
 if __name__ == "__main__":
-    print(f"saveserv listening on :{PORT}, data in {DATA}", flush=True)
+    print(f"saveserv listening on :{PORT} (HTTP, and UDP for discovery), data in {DATA}", flush=True)
+    threading.Thread(target=discovery, name="discovery", daemon=True).start()
     ThreadingHTTPServer(("", PORT), Handler).serve_forever()

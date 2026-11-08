@@ -4,6 +4,6 @@ COPY saveserv.py .
 COPY web ./web
 ENV SAVESERV_DATA=/data SAVESERV_PORT=8787 PYTHONUNBUFFERED=1
 VOLUME /data
-EXPOSE 8787
+EXPOSE 8787 8787/udp
 USER 1000:1000
 CMD ["python3", "-I", "saveserv.py"]
