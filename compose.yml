@@ -1,5 +1,5 @@
-# docker compose up -d   ->  http://saveserv.docker-host.lan (the container name is
-# the subdomain of a prefix-routing proxy), or http://docker-host.lan:8787 directly
+# docker compose up -d   ->  http://<this machine>:8787 (or, behind a prefix-routing
+# proxy, the container's name as a subdomain: http://saveserv.<host>)
 services:
   saveserv:
     build: .
@@ -19,5 +19,6 @@ services:
       # the Account page. "open": anyone on the network may register.
       SAVESERV_REGISTER: first
       SAVESERV_KEEP: "50"
-      # The address devices should use, announced to discovery.
-      SAVESERV_URL: http://saveserv.docker-host.lan
+      # The address devices should use, announced to discovery. Set it in a
+      # .env file next to this one; empty: devices use the address that answered.
+      SAVESERV_URL: ${SAVESERV_URL:-}

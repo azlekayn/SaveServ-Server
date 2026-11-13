@@ -79,6 +79,11 @@ MAX_SAVE = 16 << 20
 MAX_IMAGE = 3 << 20
 MAX_DELETED = 200  # hashes remembered per slot, newest kept
 PIN_TTL = 600
+MAX_PAIRS = 2048           # pairings waiting for a PIN, in all (asking for one needs no account)
+MAX_PAIRS_PER_ADDR = 32    # and from one address (behind a reverse proxy, the proxy's)
+LOGIN_TRIES = 8            # wrong passwords for one name from one address, then it waits
+LOGIN_WINDOW = 300
+MAX_LOGIN_FAILS = 4096     # names remembered, newest kept
 NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 # Slots may be ROM-style file names ("Golden Sun (USA)"), but no path parts.
 SLOT = re.compile(r"^(?!\.\.?$)[^/\\\x00-\x1f]{1,200}$")
@@ -125,6 +130,34 @@ DB.commit()
 # Pending pairings live in memory: id -> {pin, name, expires, token, account}
 PAIRS = {}
 PAIRS_LOCK = threading.Lock()
+# Wrong passwords: (address, name) -> [count, when the window ends]
+LOGIN_FAILS = {}
+LOGIN_LOCK = threading.Lock()
+
+
+class TooLarge(ValueError):
+    """A request body over its limit: answered with a 413."""
+
+
+def login_wait(key):
+    """Seconds this address must wait before trying this name again (0: it may try)."""
+    with LOGIN_LOCK:
+        f = LOGIN_FAILS.get(key)
+        if not f:
+            return 0
+        left = f[1] - time.time()
+        if left <= 0:
+            del LOGIN_FAILS[key]
+            return 0
+        return int(left) + 1 if f[0] >= LOGIN_TRIES else 0
+
+
+def login_failed(key):
+    with LOGIN_LOCK:
+        f = LOGIN_FAILS.setdefault(key, [0, time.time() + LOGIN_WINDOW])
+        f[0] += 1
+        while len(LOGIN_FAILS) > MAX_LOGIN_FAILS:
+            del LOGIN_FAILS[next(iter(LOGIN_FAILS))]  # dicts keep insertion order: the oldest
 
 
 def db(sql, args=(), one=False):
@@ -486,7 +519,7 @@ class Handler(BaseHTTPRequestHandler):
                 left -= len(got)
             if n > 4 * MAX_SAVE:
                 self.close_connection = True
-            raise ValueError("too large")
+            raise TooLarge("too large")
         return self.rfile.read(n) if n else b""
 
     def json_body(self):
@@ -575,6 +608,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 return self.static("index.html")  # the single page handles every other path
             return self.err(404, "not found")
+        except TooLarge as e:
+            self.err(413, str(e))
         except ValueError as e:
             self.err(400, str(e))
 
@@ -592,12 +627,16 @@ class Handler(BaseHTTPRequestHandler):
             with PAIRS_LOCK:
                 for k in [k for k, v in PAIRS.items() if v["expires"] < now]:
                     del PAIRS[k]
+                addr = self.client_address[0]
+                if (len(PAIRS) >= MAX_PAIRS
+                        or sum(v.get("addr") == addr and not v["token"] for v in PAIRS.values()) >= MAX_PAIRS_PER_ADDR):
+                    return self.err(429, "Too many devices are waiting to pair. Try again in a few minutes.")
                 used = {v["pin"] for v in PAIRS.values()}
                 pin = f"{secrets.randbelow(10**6):06d}"
                 while pin in used:
                     pin = f"{secrets.randbelow(10**6):06d}"
                 pid = secrets.token_urlsafe(24)
-                PAIRS[pid] = {"pin": pin, "name": name, "expires": now + PIN_TTL, "token": None}
+                PAIRS[pid] = {"pin": pin, "name": name, "expires": now + PIN_TTL, "token": None, "addr": addr}
             return self.send(200, {"id": pid, "pin": pin, "expires": PIN_TTL})
         if len(p) == 2 and p[0] == "pair" and method == "GET":
             with PAIRS_LOCK:
@@ -788,10 +827,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"ok": True}, headers=[self.login(uid)])
         if p == ["login"] and method == "POST":
             f = self.json_body()
-            row = db("select id, pw from users where name=?", (str(f.get("name", "")).strip(),), one=True)
+            name = str(f.get("name", "")).strip()
+            key = (self.client_address[0], name[:64])
+            wait = login_wait(key)
+            if wait:
+                return self.send(429, {"error": f"Too many wrong passwords. Try again in {wait} seconds."},
+                                 headers=[("Retry-After", str(wait))])
+            row = db("select id, pw from users where name=?", (name,), one=True)
             if not row or not check_pw(str(f.get("password", "")), row[1]):
+                login_failed(key)
                 time.sleep(0.5)
                 return self.err(401, "Wrong name or password.")
+            with LOGIN_LOCK:
+                LOGIN_FAILS.pop(key, None)
             return self.send(200, {"ok": True}, headers=[self.login(row[0])])
 
         user = self.session()
