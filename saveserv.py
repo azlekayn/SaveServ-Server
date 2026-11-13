@@ -18,6 +18,11 @@ Saves are addressed as <game>/<slot>: a recomp uses its game id and version
   PUT  /api/meta/<game>                {"title", "system", "rom", "slots": {"remix": "Remix"}}
        optional: how the website names the game and finds its box art
 
+A memory card folder (PCSX2's folder cards, Dolphin's GCI folders) is a game
+whose meta system is "ps2" or "gc": each save on the card is a slot (the PS2
+save's folder name, or the GameCube save's maker-gamecode-filename), named by
+the save's own title, and shown as its own cover.
+
 The website (server/web/) is a single page that talks to /web/* with the
 session cookie. Covers come from, in order: an uploaded cover for the save,
 an uploaded cover for the game, libretro box art (system + ROM name), a search
@@ -88,6 +93,9 @@ SYSTEMS = {
     "genesis": "Sega - Mega Drive - Genesis", "sms": "Sega - Master System - Mark III",
     "gg": "Sega - Game Gear", "psx": "Sony - PlayStation", "pce": "NEC - PC Engine - TurboGrafx 16",
 }
+
+# Memory card systems (a game's meta system): badge, libretro-thumbnails folder.
+CARDS = {"ps2": ("PS2", "Sony - PlayStation 2"), "gc": ("GC", "Nintendo - GameCube")}
 
 os.makedirs(os.path.join(DATA, "blobs"), exist_ok=True)
 DB_LOCK = threading.Lock()
@@ -252,7 +260,7 @@ def best_match(folder, rom):
 
 def libretro_art(system, rom):
     """Box art from thumbnails.libretro.com, cached (also misses, for a day)."""
-    folder = SYSTEMS.get(system)
+    folder = SYSTEMS.get(system) or CARDS.get(system, (None, None))[1]
     if not (THUMBNAILS and folder and rom):
         return None
     key = f"{folder}/{rom}"
@@ -691,6 +699,11 @@ class Handler(BaseHTTPRequestHandler):
             if row and row[0]:
                 return row[0]
         g = db("select system, rom, title from games where user=? and game=?", (uid, game), one=True)
+        if g and g[0] in CARDS:  # a memory card: the save's own title, if it has one
+            named = db("select title from meta where user=? and game=? and slot=?", (uid, game, slot), one=True)
+            if not (named and named[0]):
+                return None
+            return libretro_art(g[0], named[0]) or title_art(named[0], True)
         art = None
         if g and g[0] and g[1]:
             art = libretro_art(g[0], g[1])
@@ -730,10 +743,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(404, "not found", "text/plain")
         with open(blob_path(row[0]), "rb") as f:
             data = f.read()
-        fn = re.sub(r"[^A-Za-z0-9 _.()-]", "_", f"{p[0]}-{p[1]}-r{p[2]}.sav")
+        ext = {"ps2": "tar", "gc": "gci"}.get(self.card_system(user["id"], p[0]), "sav")
+        fn = re.sub(r"[^A-Za-z0-9 _.()-]", "_", f"{p[0]}-{p[1]}-r{p[2]}.{ext}")
         self.send(200, data, "application/octet-stream", [("Content-Disposition", f'attachment; filename="{fn}"')])
 
+    def card_system(self, uid, game):
+        """"ps2" or "gc" when this game is a memory card folder."""
+        g = db("select system from games where user=? and game=?", (uid, game), one=True)
+        return g[0] if g and g[0] in CARDS else None
+
     def game_title(self, uid, game, slot):
+        if self.card_system(uid, game):
+            named = db("select title from meta where user=? and game=? and slot=?", (uid, game, slot), one=True)
+            return named[0] if named and named[0] else slot
         g = db("select title from games where user=? and game=?", (uid, game), one=True)
         if g and g[0]:
             return g[0]
@@ -931,8 +953,11 @@ class Handler(BaseHTTPRequestHandler):
         if game in SYSTEMS and m and m[0]:
             title, version = m[0], None
         stamp = ((m[1] if m else None) or (gm[0] if gm else None) or "auto")[:8]
+        card = self.card_system(uid, game)
+        if card:
+            title, version = (m[0] if m and m[0] else slot), None
         return {"game": game, "slot": slot, "title": title, "version": version,
-                "system": game if game in SYSTEMS else None,
+                "system": CARDS[card][0].lower() if card else (game if game in SYSTEMS else None),
                 "cover": f"/cover/{quote(game, safe='')}/{quote(slot, safe='')}?v={stamp}"}
 
 
